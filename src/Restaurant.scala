@@ -1,7 +1,8 @@
 import java.util.concurrent.atomic.AtomicInteger
-import scala.reflect.runtime.universe._
 
+import scala.reflect.runtime.universe._
 import scala.collection.immutable.Queue
+import scala.util.Random
 
 object Id {
   var a = new AtomicInteger(100)
@@ -33,31 +34,41 @@ case class Placed(order: Order) extends Event {
 }
 case class CookFood(causedBy: OrderMsg, order: Order) extends Command {
   val corrId = causedBy.corrId
-  val causeId = order.id
+  val causeId = causedBy.msgId
 }
 case class Cooked(causedBy: OrderMsg, order: Order) extends Event {
   val corrId = causedBy.corrId
-  val causeId = order.id
+  val causeId = causedBy.msgId
+}
+case class CookingTimedOut(causedBy: OrderMsg, order: Order) extends Event {
+  val corrId = causedBy.corrId
+  val causeId = causedBy.msgId
 }
 case class BillOrder(causedBy: OrderMsg, order: Order) extends Command {
   val corrId  = causedBy.corrId
-  val causeId = order.id
+  val causeId = causedBy.msgId
 }
 case class Billed(causedBy: OrderMsg, order: Order) extends Event {
   val corrId = causedBy.corrId
-  val causeId = order.id
+  val causeId = causedBy.msgId
 }
 case class TakePayment(causedBy: OrderMsg, order: Order) extends Command {
   val corrId = causedBy.corrId
-  val causeId = order.id
+  val causeId = causedBy.msgId
 }
 case class Payed(causedBy: OrderMsg, order: Order) extends Event {
   val corrId = causedBy.corrId
-  val causeId = order.id
+  val causeId = causedBy.msgId
 }
 case class Dropped(causedBy: OrderMsg, order: Order) extends Event {
   val corrId = causedBy.corrId
-  val causeId = order.id
+  val causeId = causedBy.msgId
+}
+case class PublishAt(delay: Long, event: Event) extends Command {
+  val corrId = event.corrId
+  val causeId = event.msgId
+  val order = event.order
+  val publishAfter = System.currentTimeMillis() + delay
 }
 
 case class Order(
@@ -157,12 +168,12 @@ case class Managers(publisher: Publisher) extends Handles[OrderMsg] {
     map = map - corrId
   }
 
-  override def handle(order: OrderMsg): Unit = {
-    order match {
+  override def handle(msg: OrderMsg): Unit = {
+    msg match {
       case event: Event => {
-        map.get(order.corrId) match {
+        map.get(msg.corrId) match {
           case Some(m) => m.handle(event)
-          case None => order.log(s"No manager subscribed to this order ${order.corrId}")
+          case None => msg.log(s"No manager subscribed to this order ${msg}")
         }
       }
       case cmd: Command => {
@@ -176,10 +187,25 @@ trait Manager extends Handles[Event]
 
 case class PayLast(publisher: Publisher, doneCallback : () => Unit) extends Manager {
   val id = Id.next
+  var cookingDone = false
   override def handle(msg: Event): Unit = {
     msg match {
-      case Placed(_) => publisher.publish(CookFood(msg, msg.order))
-      case Cooked(_,_) => publisher.publish(BillOrder(msg, msg.order))
+      case Placed(_) => {
+        publisher.publish(PublishAt(500, CookingTimedOut(msg, msg.order)))
+        publisher.publish(CookFood(msg, msg.order))
+      }
+      case Cooked(_,_) => {
+        cookingDone = true
+        msg.log("Cooking done")
+        publisher.publish(BillOrder(msg, msg.order))
+      }
+      case CookingTimedOut(_,_) => {
+        if (!cookingDone) {
+          msg.log(s"timed out - reschedule order ${msg.order.id}")
+          publisher.publish(PublishAt(500, CookingTimedOut(msg, msg.order)))
+          publisher.publish(CookFood(msg, msg.order))
+        }
+      }
       case Billed(_,_) => publisher.publish(TakePayment(msg, msg.order))
       case Payed(_,_) => doneCallback()
       case Dropped(_,_) => {} // cry
@@ -245,16 +271,18 @@ case class ThreadedHandler[M](name: String, next: Handles[M])
 
   override def run(): Unit = {
     while (true) {
-      if (queue.size > 0) {
-        val msg = queue.dequeue
-        val order = msg.asInstanceOf[OrderMsg].order
+      queue.dequeueFirst(_ => true) match {
+        case Some(msg: OrderMsg) => {
+          next.handle(msg.asInstanceOf[M])
+        }
+        case _ => // noop
+
 //        msg
 //          .asInstanceOf[OrderMsg]
 //          .log(
 //            s"$name: Dequeued order ${order.id.id}. Order queue is now ${queue.size}")
-        next.handle(msg)
       }
-      Thread.sleep(1)
+      Thread.sleep(20)
     }
   }
 }
@@ -294,7 +322,7 @@ case class ShortestQueue[M](handlers: Seq[ThreadedHandler[M]])
 }
 
 case class TTLChecker[M](next: Handles[M], publisher: Publisher)
-    extends Handles[M] {
+  extends Handles[M] {
   override def handle(msg: M): Unit = {
     val omsg = msg.asInstanceOf[OrderMsg]
     val order = omsg.order
@@ -303,6 +331,22 @@ case class TTLChecker[M](next: Handles[M], publisher: Publisher)
       publisher.publish(Dropped(omsg, order))
     } else {
       next.handle(msg)
+    }
+  }
+}
+
+case class Entropy[M](next: Handles[M], publisher: Publisher)
+  extends Handles[M] {
+  val random = Random
+  override def handle(msg: M): Unit = {
+    random.nextFloat() match {
+      case x if x < 0.2 => Console.println("dropped " + msg)
+      case x if x > 0.8 => {
+        Console.println("duplication of " + msg)
+        next.handle(msg)
+        next.handle(msg)
+      }
+      case _ => next.handle(msg)
     }
   }
 }
@@ -348,6 +392,28 @@ object MsgPub extends Publisher {
     PubSub.publish(omsg.corrId, msg)
   }
 }
+
+class AlarmClock(publisher: Publisher) extends Thread with Handles[PublishAt] {
+  var scheduled : Vector[PublishAt] = Vector()
+
+  override def handle(cmd: PublishAt): Unit = {
+    scheduled = scheduled ++ Vector(cmd)
+  }
+
+  override def run() = {
+    Thread.currentThread().setName("Clk")
+    while (true) {
+      val now = System.currentTimeMillis()
+      val (pub, wait) = scheduled.partition(_.publishAfter < now)
+      scheduled = wait
+      for (publish <- pub) {
+        publisher.publish(publish.event)
+      }
+      Thread.sleep(10)
+    }
+  }
+}
+
 
 object PubSub {
   var topics: Map[String, List[Handles[_]]] = Map()
@@ -396,11 +462,12 @@ object Main extends App {
   val cashier = ThreadedHandler("Cas", Cashier(MsgPub))
   val assistantMgr = ThreadedHandler("Ass", AssistantManager(MsgPub))
   def cook(name: String, speed: Long) =
-    ThreadedHandler(name, TTLChecker(Cook(name, speed, MsgPub), MsgPub))
+    ThreadedHandler(name, Entropy(Cook(name, speed, MsgPub), MsgPub))
   val cooks = Seq(cook("Bob", 5000), cook("Tom", 500), cook("Jim", 300))
   private val kitchen = ThreadedHandler("Chf", ShortestQueue(cooks))
   val waiter = Waiter(MsgPub)
   val customers = new Customers(waiter)
+  val alarm = new AlarmClock(MsgPub)
 
   // subscription
   PubSub.subscribe(orderInitializer)
@@ -408,6 +475,7 @@ object Main extends App {
   PubSub.subscribe(assistantMgr)
   PubSub.subscribe(cashier)
   PubSub.subscribe(OrderPrinter)
+  PubSub.subscribe(alarm)
 
   // start
   // new Monitor(cooks).start()
@@ -417,4 +485,5 @@ object Main extends App {
   cooks.map(_.start())
   kitchen.start()
   customers.start()
+  alarm.start()
 }
