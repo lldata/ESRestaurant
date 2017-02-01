@@ -13,11 +13,10 @@ case class Id(id: Int) {
   override def toString = "" + id
 }
 
-abstract class OrderMsg(
-    val msgId: Id = Id.next,
-    val corrId: Id,
-    val causeId: Id
-) {
+sealed trait OrderMsg {
+  val msgId: Id = Id.next
+  val corrId: Id
+  val causeId: Id
   def order: Order
   def log(msg: String): Unit = {
     val tname = Thread.currentThread().getName
@@ -25,22 +24,41 @@ abstract class OrderMsg(
     Console.println(s"${tname}|${corrId}|m${msgId}|c${causeId}|o${o.id}|${msg}")
   }
 }
-case class Placed(order: Order)
-    extends OrderMsg(corrId = Id.next, causeId = order.id)
-case class CookFood(causedBy: OrderMsg, order: Order)
-    extends OrderMsg(corrId = causedBy.corrId, causeId = causedBy.msgId)
-case class Cooked(causedBy: OrderMsg, order: Order)
-    extends OrderMsg(corrId = causedBy.corrId, causeId = causedBy.msgId)
-case class BillOrder(causedBy: OrderMsg, order: Order)
-    extends OrderMsg(corrId = causedBy.corrId, causeId = causedBy.msgId)
-case class Billed(causedBy: OrderMsg, order: Order)
-    extends OrderMsg(corrId = causedBy.corrId, causeId = causedBy.msgId)
-case class TakePayment(causedBy: OrderMsg, order: Order)
-    extends OrderMsg(corrId = causedBy.corrId, causeId = causedBy.msgId)
-case class Payed(causedBy: OrderMsg, order: Order)
-    extends OrderMsg(corrId = causedBy.corrId, causeId = causedBy.msgId)
-case class Dropped(causedBy: OrderMsg, order: Order)
-    extends OrderMsg(corrId = causedBy.corrId, causeId = causedBy.msgId)
+sealed trait Command extends OrderMsg
+sealed trait Event extends OrderMsg
+
+case class Placed(order: Order) extends Event {
+  val corrId = Id.next
+  val causeId = order.id
+}
+case class CookFood(causedBy: OrderMsg, order: Order) extends Command {
+  val corrId = causedBy.corrId
+  val causeId = order.id
+}
+case class Cooked(causedBy: OrderMsg, order: Order) extends Event {
+  val corrId = causedBy.corrId
+  val causeId = order.id
+}
+case class BillOrder(causedBy: OrderMsg, order: Order) extends Command {
+  val corrId  = causedBy.corrId
+  val causeId = order.id
+}
+case class Billed(causedBy: OrderMsg, order: Order) extends Event {
+  val corrId = causedBy.corrId
+  val causeId = order.id
+}
+case class TakePayment(causedBy: OrderMsg, order: Order) extends Command {
+  val corrId = causedBy.corrId
+  val causeId = order.id
+}
+case class Payed(causedBy: OrderMsg, order: Order) extends Event {
+  val corrId = causedBy.corrId
+  val causeId = order.id
+}
+case class Dropped(causedBy: OrderMsg, order: Order) extends Event {
+  val corrId = causedBy.corrId
+  val causeId = order.id
+}
 
 case class Order(
     id: Id,
@@ -140,32 +158,38 @@ case class Managers(publisher: Publisher) extends Handles[OrderMsg] {
   }
 
   override def handle(order: OrderMsg): Unit = {
-    map.get(order.corrId) match {
-      case Some(m) => m.handle(order)
-      case None => order.log(s"No manager subscribed to this order ${order.corrId}")
+    order match {
+      case event: Event => {
+        map.get(order.corrId) match {
+          case Some(m) => m.handle(event)
+          case None => order.log(s"No manager subscribed to this order ${order.corrId}")
+        }
+      }
+      case cmd: Command => {
+        // noop
+      }
     }
   }
 }
 
-trait Manager extends Handles[OrderMsg]
+trait Manager extends Handles[Event]
 
 case class PayLast(publisher: Publisher, doneCallback : () => Unit) extends Manager {
   val id = Id.next
-  override def handle(msg: OrderMsg): Unit = {
+  override def handle(msg: Event): Unit = {
     msg match {
       case Placed(_) => publisher.publish(CookFood(msg, msg.order))
       case Cooked(_,_) => publisher.publish(BillOrder(msg, msg.order))
       case Billed(_,_) => publisher.publish(TakePayment(msg, msg.order))
       case Payed(_,_) => doneCallback()
       case Dropped(_,_) => {} // cry
-      case _ =>  // ignore
     }
   }
 }
 
 case class PayFirst(publisher: Publisher, doneCallback : () => Unit) extends Manager {
   val id = Id.next
-  override def handle(msg: OrderMsg): Unit = {
+  override def handle(msg: Event): Unit = {
     msg match {
       case Placed(_) => publisher.publish(BillOrder(msg, msg.order))
       case Billed(_,_) => publisher.publish(TakePayment(msg, msg.order))
