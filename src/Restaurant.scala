@@ -22,7 +22,7 @@ abstract class OrderMsg(
   def log(msg: String): Unit = {
     val tname = Thread.currentThread().getName
     val o = order
-    Console.println(s"${tname}|${msgId}|${corrId}|${causeId}|${o.id}|${msg}")
+    Console.println(s"${tname}|${corrId}|m${msgId}|c${causeId}|o${o.id}|${msg}")
   }
 }
 case class Placed(order: Order)
@@ -88,31 +88,92 @@ case class Waiter(publisher: Publisher) {
 }
 
 case class Cook(name: String, speed: Long, publisher: Publisher)
-    extends Handles[Placed] {
-  override def handle(placed: Placed): Unit = {
+    extends Handles[CookFood] {
+  override def handle(msg: CookFood): Unit = {
     val cake = List("water", "sugar", "butter")
-    placed.log(s"$name is cooking ... $cake")
+    msg.log(s"$name is cooking ... $cake")
     Thread.sleep(speed)
-    publisher.publish(Cooked(placed, placed.order.copy(ingredients = cake)))
+    publisher.publish(Cooked(msg, msg.order.copy(ingredients = cake)))
   }
 }
 
-case class AssistantManager(publisher: Publisher) extends Handles[Cooked] {
-  override def handle(cooked: Cooked): Unit = {
-    cooked.log("Assistant Manager adding prices")
+case class AssistantManager(publisher: Publisher) extends Handles[BillOrder] {
+  override def handle(msg: BillOrder): Unit = {
+    msg.log("Assistant Manager adding prices")
     Thread.sleep(500L)
     publisher.publish(
-      Billed(cooked, cooked.order.copy(subTotal = 100, tax = 40, total = 140)))
+      Billed(msg, msg.order.copy(subTotal = 100, tax = 40, total = 140)))
   }
 }
 
-case class Cashier(publisher: Publisher) extends Handles[Billed] {
+case class Cashier(publisher: Publisher) extends Handles[TakePayment] {
   var total = 0
-  override def handle(billed: Billed): Unit = {
-    billed.log(s"Cashier getting money. Total is now ${total}")
+  override def handle(msg: TakePayment): Unit = {
+    msg.log(s"Cashier getting money. Total is now ${total}")
     Thread.sleep(500L)
-    total = total + billed.order.total
-    publisher.publish(Payed(billed, billed.order.copy(payed = true)))
+    total = total + msg.order.total
+    publisher.publish(Payed(msg, msg.order.copy(payed = true)))
+  }
+}
+
+case class OrderInitializer(publisher: Publisher, managers: Managers) extends Handles[Placed] {
+  override def handle(order: Placed): Unit = managers.start(order)
+}
+
+case class Managers(publisher: Publisher) extends Handles[OrderMsg] {
+  var map : Map[Id, Manager] = Map()
+
+  def start(order : Placed) : Unit = {
+    PubSub.subscribe(order.corrId, this)
+    val manager = if (order.corrId.id % 2 == 0) {
+      new PayLast(publisher, () => done(order.corrId))
+    } else {
+      new PayFirst(publisher, () => done(order.corrId))
+    }
+    map = map.updated(order.corrId, manager)
+    manager.handle(order)
+  }
+
+  def done(corrId : Id): Unit = {
+    Console.println(s"removing manager for ${corrId}")
+    map = map - corrId
+  }
+
+  override def handle(order: OrderMsg): Unit = {
+    map.get(order.corrId) match {
+      case Some(m) => m.handle(order)
+      case None => order.log(s"No manager subscribed to this order ${order.corrId}")
+    }
+  }
+}
+
+trait Manager extends Handles[OrderMsg]
+
+case class PayLast(publisher: Publisher, doneCallback : () => Unit) extends Manager {
+  val id = Id.next
+  override def handle(msg: OrderMsg): Unit = {
+    msg match {
+      case Placed(_) => publisher.publish(CookFood(msg, msg.order))
+      case Cooked(_,_) => publisher.publish(BillOrder(msg, msg.order))
+      case Billed(_,_) => publisher.publish(TakePayment(msg, msg.order))
+      case Payed(_,_) => doneCallback()
+      case Dropped(_,_) => {} // cry
+      case _ =>  // ignore
+    }
+  }
+}
+
+case class PayFirst(publisher: Publisher, doneCallback : () => Unit) extends Manager {
+  val id = Id.next
+  override def handle(msg: OrderMsg): Unit = {
+    msg match {
+      case Placed(_) => publisher.publish(BillOrder(msg, msg.order))
+      case Billed(_,_) => publisher.publish(TakePayment(msg, msg.order))
+      case Payed(_,_) => publisher.publish(CookFood(msg, msg.order))
+      case Cooked(_,_) => doneCallback()
+      case Dropped(_,_) => {} // cry
+      case _ =>  // ignore
+    }
   }
 }
 
@@ -143,9 +204,9 @@ case class ThreadedHandler[M](name: String, next: Handles[M])
   override def handle(msg: M): Unit = {
     val order = msg.asInstanceOf[OrderMsg].order
     queue.enqueue(msg)
-    msg
-      .asInstanceOf[OrderMsg]
-      .log(s"$name: Queued ${order.id.id}. Order queue is now ${queue.size}")
+//    msg
+//      .asInstanceOf[OrderMsg]
+//      .log(s"$name: Queued ${order.id.id}. Order queue is now ${queue.size}")
   }
 
   def count = queue.size
@@ -153,7 +214,7 @@ case class ThreadedHandler[M](name: String, next: Handles[M])
   def start(): ThreadedHandler[M] = {
     val thread = new Thread(this)
     thread.setName(name)
-    Console.println(s"Starting thread ${thread.getId}")
+    // Console.println(s"Starting thread ${thread.getId}")
     thread.start()
     this
   }
@@ -163,10 +224,10 @@ case class ThreadedHandler[M](name: String, next: Handles[M])
       if (queue.size > 0) {
         val msg = queue.dequeue
         val order = msg.asInstanceOf[OrderMsg].order
-        msg
-          .asInstanceOf[OrderMsg]
-          .log(
-            s"$name: Dequeued order ${order.id.id}. Order queue is now ${queue.size}")
+//        msg
+//          .asInstanceOf[OrderMsg]
+//          .log(
+//            s"$name: Dequeued order ${order.id.id}. Order queue is now ${queue.size}")
         next.handle(msg)
       }
       Thread.sleep(1)
@@ -225,6 +286,7 @@ case class TTLChecker[M](next: Handles[M], publisher: Publisher)
 class Monitor[M](monitor: Seq[ThreadedHandler[M]]) extends Thread {
   val starttime = System.currentTimeMillis()
   override def run() = {
+    Thread.currentThread().setName("Mon")
     while (true) {
       Thread.sleep(500)
       var total = (monitor.map(c => c.count).sum)
@@ -242,28 +304,44 @@ class Monitor[M](monitor: Seq[ThreadedHandler[M]]) extends Thread {
   }
 }
 
-trait Publisher {
-  def publish[M](msg: M)(implicit tag: TypeTag[M]): Unit
-  def publish[M](topic: String, msg: M): Unit
-  def publish[M](corrId: Id, msg: M): Unit
+class Customers(waiter: Waiter) extends Thread {
+  override def run() = {
+    Thread.currentThread().setName("Cus")
+    for (i <- 0 until 4) {
+      waiter.placeOrder("cake")
+    }
+  }
 }
 
-object PubSub extends Publisher {
+trait Publisher {
+  def publish[M <: OrderMsg](msg: M)(implicit tag: TypeTag[M]): Unit
+}
+
+object MsgPub extends Publisher {
+  def publish[M <: OrderMsg](msg: M)(implicit tag: TypeTag[M]): Unit = {
+    val omsg = msg.asInstanceOf[OrderMsg]
+    PubSub.publish(msg)
+    PubSub.publish(omsg.corrId, msg)
+  }
+}
+
+object PubSub {
   var topics: Map[String, List[Handles[_]]] = Map()
 
-  override def publish[M](msg: M)(implicit tag: TypeTag[M]): Unit = {
+  def publish[M](msg: M)(implicit tag: TypeTag[M]): Unit = {
     // this and the implicit is magic to get the type of M
     val topic = tag.tpe.toString
 
     publish(topic, msg)
   }
 
-  override def publish[M](corrId: Id, msg: M): Unit = {
+  def publish[M](corrId: Id, msg: M): Unit = {
     publish(corrId.toString, msg)
   }
 
-  override def publish[M](topic: String, msg: M): Unit = {
-    for (handler <- topics.getOrElse(topic, Nil)) {
+  def publish[M](topic: String, msg: M): Unit = {
+    val handlers = topics.getOrElse(topic, Nil)
+    for (handler <- handlers) {
       //handler.handle(msg)
       val handleMethod =
         handler.getClass.getMethods.find(m => m.getName() == "handle").get
@@ -287,38 +365,32 @@ object PubSub extends Publisher {
 }
 
 object Main extends App {
-  Thread.currentThread().setName("Man")
+  Thread.currentThread().setName("main")
   // construction
-  val cashier = ThreadedHandler("Cas", Cashier(PubSub))
-  val assistantMgr = ThreadedHandler("Ass", AssistantManager(PubSub))
+  val managers = Managers(MsgPub)
+  val orderInitializer = ThreadedHandler("Mgr", OrderInitializer(MsgPub, managers))
+  val cashier = ThreadedHandler("Cas", Cashier(MsgPub))
+  val assistantMgr = ThreadedHandler("Ass", AssistantManager(MsgPub))
   def cook(name: String, speed: Long) =
-    ThreadedHandler(name, TTLChecker(Cook(name, speed, PubSub), PubSub))
+    ThreadedHandler(name, TTLChecker(Cook(name, speed, MsgPub), MsgPub))
   val cooks = Seq(cook("Bob", 5000), cook("Tom", 500), cook("Jim", 300))
   private val kitchen = ThreadedHandler("Chf", ShortestQueue(cooks))
-  val waiter = Waiter(PubSub)
+  val waiter = Waiter(MsgPub)
+  val customers = new Customers(waiter)
 
   // subscription
+  PubSub.subscribe(orderInitializer)
   PubSub.subscribe(kitchen)
   PubSub.subscribe(assistantMgr)
   PubSub.subscribe(cashier)
   PubSub.subscribe(OrderPrinter)
 
-  PubSub.subscribe(new Handles[Placed] {
-    override def handle(order: Placed): Unit =
-      PubSub.subscribe(order.corrId, new Handles[OrderMsg] {
-        override def handle(order: OrderMsg): Unit =
-          order.log("correlation sub")
-      })
-  })
-
   // start
-  new Monitor(cooks).start()
+  // new Monitor(cooks).start()
+  orderInitializer.start()
   cashier.start()
   assistantMgr.start()
   cooks.map(_.start())
   kitchen.start()
-
-  for (i <- 0 until 20) {
-    waiter.placeOrder("cake")
-  }
+  customers.start()
 }
